@@ -1,10 +1,14 @@
+# Copied from https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/llama.py
+# Copyright © 2023-2024 Apple Inc.
+
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, BatchedKVCache, create_additive_causal_mask
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -16,6 +20,8 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
+    head_dim: Optional[int] = None
+    max_position_embeddings: Optional[int] = None
     num_key_value_heads: Optional[int] = None
     attention_bias: bool = False
     mlp_bias: bool = False
@@ -28,14 +34,6 @@ class ModelArgs(BaseModelArgs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
 
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
-
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -45,7 +43,8 @@ class Attention(nn.Module):
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
+
         self.scale = head_dim**-0.5
         if hasattr(args, "attention_bias"):
             attention_bias = args.attention_bias
@@ -57,23 +56,19 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
-            scale=rope_scale,
+        self.rope = initialize_rope(
+            self.head_dim,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
         )
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[BatchedKVCache] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -92,9 +87,10 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -135,7 +131,7 @@ class TransformerBlock(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[BatchedKVCache] = None,
+        cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -160,16 +156,13 @@ class LlamaModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        mask = None
-        if h.shape[1] > 1:
-            mask = create_additive_causal_mask(
-                h.shape[1], cache[0].offset if cache is not None else 0
-            )
-            mask = mask.astype(h.dtype)
+        if mask is None:
+            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -192,9 +185,10 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
+        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, mask, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -203,9 +197,12 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs
-        return {
+        weights = {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        return weights
 
     @property
     def layers(self):
